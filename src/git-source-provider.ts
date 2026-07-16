@@ -365,22 +365,32 @@ export async function getSource(settings: IGitSourceSettings): Promise<void> {
       settings.githubServerUrl
     )
 
-    // WarpBuild mirror: best-effort upload, run LAST in getSource so it can never affect
-    // the checkout result. Belt-and-suspenders around contribute()'s own try/catch and the
-    // scoped process guard it installs (which ignores any uncaught upload error now that
-    // the checkout is already complete).
+    // Remove auth BEFORE the best-effort mirror upload. contribute() installs a fail-open
+    // process guard that can process.exit(0) on an uncaught upload error, and process.exit does
+    // NOT unwind `finally` — so the http.extraheader credential must be cleared from the
+    // workspace .git/config first, or it could be left behind for later steps. contribute()
+    // needs no git auth (it reads local objects and PUTs to presigned URLs). Repeated
+    // idempotently in `finally` below to also cover the checkout-failure path.
+    if (authHelper && !settings.persistCredentials) {
+      core.startGroup('Removing auth')
+      await authHelper.removeAuth()
+      core.endGroup()
+    }
+
+    // WarpBuild mirror: best-effort upload, run LAST (after auth removal) so it can never affect
+    // the checkout result or leave credentials behind.
     try {
       await warpbuildMirror.contribute(settings)
     } catch (error) {
       core.warning(`WarpBuild mirror upload skipped: ${error}`)
     }
   } finally {
-    // Remove auth
+    // Remove auth — idempotent belt-and-suspenders: the pre-upload call above covers the success
+    // path; this covers a checkout failure (where the block above never ran) and clears the temp
+    // global config.
     if (authHelper) {
       if (!settings.persistCredentials) {
-        core.startGroup('Removing auth')
         await authHelper.removeAuth()
-        core.endGroup()
       }
       authHelper.removeGlobalConfig()
     }

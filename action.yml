@@ -113,7 +113,7 @@ outputs:
   commit:
     description: 'The commit SHA that was checked out'
   cache-hit:
-    description: 'Whether the checkout was restored from the WarpBuild snapshot cache (true/false)'
+    description: 'Whether the checkout was seeded from the WarpBuild git-mirror cache (true/false; WarpBuild runners only)'
 runs:
   using: node24
   main: dist/index.js
