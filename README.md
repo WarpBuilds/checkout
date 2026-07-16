@@ -14,6 +14,8 @@ checkout shape:
   a small per-branch delta bundle. Once seeded, the GitHub fetch is only the tip delta.
 - Explicit shallow (`fetch-depth >= 2`), `filter`, and `sparse-checkout` defer to upstream.
   **LFS coexists** — the cache carries the git objects and stock `git lfs` pulls the binaries on top.
+- **GitHub Enterprise** — engages on github.com and GitHub Enterprise (Server and Cloud) alike; the
+  cache is namespaced per VCS host, so a repo on one host never shares with — or collides with — another host's.
 - No new inputs; adds one output, `cache-hit` (`true` when the checkout was seeded from the
   mirror). Behavior is identical to upstream everywhere except WarpBuild runners.
 - Fail-open — any cache error degrades to stock `actions/checkout` behavior.
