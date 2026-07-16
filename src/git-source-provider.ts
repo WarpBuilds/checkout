@@ -212,6 +212,26 @@ export async function getSource(settings: IGitSourceSettings): Promise<void> {
         await warpbuildMirror.abandon(settings)
         warpbuildMode = 'off'
       }
+    } else if (warpbuildMode === 'shallow-seeded') {
+      // Seeded a shallow snapshot: fetch the tip at depth 1, negotiating against the anchored
+      // snapshot so GitHub sends only the delta. Fall back cleanly on any failure.
+      try {
+        const refSpec = refHelper.getRefSpec(settings.ref, settings.commit)
+        await git.fetch(refSpec, {...fetchOptions, fetchDepth: 1})
+        if (!(await refHelper.testRef(git, settings.ref, settings.commit))) {
+          throw new Error(
+            `The ref '${settings.ref}' does not point to the expected commit '${settings.commit}'. ` +
+              `The ref may have been updated after the workflow was triggered.`
+          )
+        }
+        warpbuildFetchDone = true
+      } catch (error) {
+        core.warning(
+          `WarpBuild shallow mirror fetch failed; falling back to standard checkout: ${error}`
+        )
+        await warpbuildMirror.abandon(settings)
+        warpbuildMode = 'off'
+      }
     }
 
     if (warpbuildFetchDone) {
