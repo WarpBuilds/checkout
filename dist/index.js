@@ -41834,6 +41834,35 @@ async function requestBaseUpload(repoKey) {
 async function requestBranchUpload(repoKey, ref, sha) {
     return requestUpload('branch/upload-url', { repo_key: repoKey, ref, sha });
 }
+async function lookupShallowRestore(repoKey, ref) {
+    try {
+        const res = await fetch(`${backend_api_endpoint('shallow/restore-url')}?repo_key=${encodeURIComponent(repoKey)}&ref=${encodeURIComponent(ref)}`, {
+            headers: { authorization: authHeader() },
+            signal: AbortSignal.timeout(API_TIMEOUT_MS)
+        });
+        if (res.status === 200) {
+            const body = (await res.json());
+            return { kind: 'restore', pack: body.pack };
+        }
+        if (res.status === 404) {
+            return { kind: 'cold' };
+        }
+        if (res.status === 403) {
+            core_debug('[wb-cache] shallow restore-url answered 403 (disabled)');
+            return { kind: 'disabled' };
+        }
+        core_debug(`[wb-cache] shallow restore-url answered ${res.status}`);
+        return { kind: 'error' };
+    }
+    catch (error) {
+        core_debug(`[wb-cache] shallow restore-url failed: ${error}`);
+        return { kind: 'error' };
+    }
+}
+// Warm branch: request the grant to overwrite this branch's shallow snapshot pack.
+async function requestShallowUpload(repoKey, ref) {
+    return requestUpload('shallow/upload-url', { repo_key: repoKey, ref });
+}
 
 ;// CONCATENATED MODULE: ./src/warpbuild/mirror-cache.ts
 /* eslint-disable i18n-text/no-en, import/no-unresolved -- upstream conventions; no TS import resolver configured */
@@ -41867,14 +41896,17 @@ const SHA_PATTERN = /^[0-9a-f]{40}([0-9a-f]{24})?$/;
 const BASE_REFNS = 'refs/wb/base';
 const BRANCH_REFNS = 'refs/wb/branch';
 const UPLOAD_TIP_REF = 'refs/wb/tip';
+// Anchors the seeded shallow snapshot's tip so git advertises it as a `have` (delta negotiation
+// reads haves from refs, not loose objects), out of the user's ref space like the others.
+const SHALLOW_BASE_REF = 'refs/wb/shallow-base';
 let plan = { mode: 'off', repoKey: '', refKey: '' };
-// Null = attempt the cache; else a reason to log. We engage only where the result matches
-// upstream: full history (fetch-depth 0) or the default depth 1. An explicit shallow depth
-// (>= 2) is a deliberate request we can't honour (the mirror is full history), so we defer
-// to upstream. sparse/filter change the object set we model, so they defer too. LFS does
-// NOT defer: the bundle carries the git objects (including LFS pointer blobs), and the
-// stock `git lfs fetch`/`checkout` steps pull the actual LFS binaries from GitHub on top,
-// exactly as upstream — the mirror only accelerates the git-object half.
+// Null = attempt the cache; else a reason to log. We engage where we can reproduce upstream:
+// full history (fetch-depth 0) via the base mirror, or the default depth 1 via a per-branch
+// shallow snapshot (routed in setupInner). An explicit deeper shallow (>= 2) is a request
+// neither flow reproduces, so it defers to upstream; sparse/filter change the object set we
+// model, so they defer too. LFS does NOT defer: the seed carries the git objects (including
+// LFS pointer blobs), and the stock `git lfs fetch`/`checkout` steps pull the actual LFS
+// binaries from GitHub on top, exactly as upstream — the mirror only accelerates git objects.
 function getMirrorCacheSkipReason(settings) {
     if (!process.env['WARPBUILD_RUNNER_VERIFICATION_TOKEN'] ||
         !process.env['WARPBUILD_HOST_URL']) {
@@ -41887,15 +41919,13 @@ function getMirrorCacheSkipReason(settings) {
     if (checkoutRepo !== process.env['GITHUB_REPOSITORY']) {
         return `repository '${checkoutRepo}' is not the workflow repository '${process.env['GITHUB_REPOSITORY']}'`;
     }
-    const server = (settings.githubServerUrl || 'https://github.com').replace(/\/+$/, '');
-    if (server !== 'https://github.com') {
-        return `server '${server}' is not github.com`;
-    }
+    // github.com + GHE both engage; the backend namespaces the cache by the runner's server-derived
+    // VCS host, so a GHE repo can't collide with — or leak into — a same-named github.com repo.
     if (!settings.commit || !SHA_PATTERN.test(settings.commit)) {
         return 'no exact commit sha to key on';
     }
-    // Respect an explicit shallow request: depth 0 (all) and the default depth 1 engage the
-    // mirror; anything deeper is a deliberate shallow the mirror can't reproduce → upstream.
+    // depth 0 (all history) and the default depth 1 both engage — 0 via the base mirror, 1 via a
+    // per-branch shallow snapshot; an explicit deeper shallow is a request neither reproduces → upstream.
     if (settings.fetchDepth > 1) {
         return `fetch-depth ${settings.fetchDepth} is an explicit shallow depth; using upstream checkout`;
     }
@@ -41930,16 +41960,22 @@ function computeRefKey(settings) {
 // branch on. Never throws. Sets the `cache-hit` output (true only when seeded from cache).
 async function setup(settings) {
     const mode = await setupImpl(settings);
-    setOutput('cache-hit', mode === 'seeded' ? 'true' : 'false');
+    setOutput('cache-hit', mode === 'seeded' || mode === 'shallow-seeded' ? 'true' : 'false');
     return mode;
 }
 // Called by getSource when a mirror-seeded fetch fails: clear our refs and disengage, so
 // the caller can retry the standard fetch against a clean repo. Also re-sets cache-hit to
 // false since we're no longer serving from cache.
 async function abandon(settings) {
+    const wasShallow = plan.mode === 'shallow-seeded';
     plan = { mode: 'off', repoKey: '', refKey: '' };
     setOutput('cache-hit', 'false');
     await cleanupWbRefs(settings.repositoryPath);
+    if (wasShallow) {
+        // The shallow seed dropped a pack and wrote .git/shallow; reset objects so the fallback
+        // `git fetch --depth 1` starts from a clean git-init shape.
+        await resetGitObjects(external_path_namespaceObject.join(settings.repositoryPath, '.git'));
+    }
 }
 async function setupImpl(settings) {
     plan = { mode: 'off', repoKey: '', refKey: '' };
@@ -41967,6 +42003,11 @@ async function setupInner(settings) {
     const repoKey = process.env['GITHUB_REPOSITORY_ID'];
     const refKey = computeRefKey(settings);
     plan = { mode: 'off', repoKey, refKey };
+    // fetch-depth 1 (the default) uses a small per-branch shallow snapshot + a GitHub delta,
+    // not the full base mirror — the base flow below is for full history (depth 0).
+    if (settings.fetchDepth === 1) {
+        return await setupShallow(settings, repoKey, refKey);
+    }
     const lookup = await lookupRestore(repoKey, refKey);
     if (lookup.kind === 'disabled') {
         info('Mirror cache is disabled by the backend for this organization');
@@ -42008,6 +42049,65 @@ async function setupInner(settings) {
     plan = { mode: 'seeded', repoKey, refKey };
     return 'seeded';
 }
+// fetch-depth 1: seed a small per-branch shallow snapshot (the tip's own pack) so the GitHub
+// fetch is a depth-1 delta against it. Miss → standard shallow fetch, then cache the snapshot
+// in POST. Needs a durable branch to key on (tags/detached HEAD have none → upstream).
+async function setupShallow(settings, repoKey, refKey) {
+    if (!refKey) {
+        info('No durable branch to key the shallow snapshot on; using standard shallow checkout');
+        return 'off';
+    }
+    const lookup = await lookupShallowRestore(repoKey, refKey);
+    if (lookup.kind === 'disabled') {
+        info('Mirror cache is disabled by the backend for this organization');
+        return 'off';
+    }
+    if (lookup.kind === 'error') {
+        info('Mirror cache backend unavailable; using standard checkout');
+        return 'off';
+    }
+    if (lookup.kind === 'cold') {
+        info('No cached shallow snapshot for this branch; standard shallow checkout, then caching it');
+        plan = { mode: 'shallow-cold', repoKey, refKey };
+        return 'shallow-cold';
+    }
+    await seedShallowPack(settings.repositoryPath, lookup.pack.url);
+    info('Seeded shallow snapshot; the GitHub fetch will be a depth-1 delta');
+    plan = { mode: 'shallow-seeded', repoKey, refKey };
+    return 'shallow-seeded';
+}
+// Restore a cached shallow snapshot: drop its pack into the object store and index it in place
+// (git pairs .pack/.idx by basename), then mark the pack's lone commit as the shallow boundary
+// and anchor it to a ref so git advertises it as a `have` for the delta fetch.
+async function seedShallowPack(repoPath, url) {
+    const gitDir = external_path_namespaceObject.join(repoPath, '.git');
+    const packPath = external_path_namespaceObject.join(gitDir, 'objects', 'pack', `wb-shallow-${external_crypto_namespaceObject.randomBytes(12).toString('hex')}.pack`);
+    await downloadTo(url, packPath, 'shallow');
+    await exec_exec('git', ['-C', repoPath, 'index-pack', packPath]);
+    const tip = await deriveShallowTip(repoPath);
+    await external_fs_namespaceObject.promises.writeFile(external_path_namespaceObject.join(gitDir, 'shallow'), `${tip}\n`);
+    await exec_exec('git', ['-C', repoPath, 'update-ref', SHALLOW_BASE_REF, tip]);
+}
+// The cached snapshot pack holds exactly one commit — the tip. Return it (what we write to
+// .git/shallow and anchor). Throws if the pack isn't a clean single-commit depth-1 snapshot.
+async function deriveShallowTip(repoPath) {
+    let out = '';
+    await exec_exec('git', [
+        '-C',
+        repoPath,
+        'cat-file',
+        '--batch-all-objects',
+        '--batch-check=%(objecttype) %(objectname)'
+    ], { silent: true, listeners: { stdout: (d) => (out += d.toString()) } });
+    const commits = out
+        .split('\n')
+        .filter(l => l.startsWith('commit '))
+        .map(l => l.slice('commit '.length).trim());
+    if (commits.length !== 1) {
+        throw new Error(`shallow snapshot has ${commits.length} commits, expected exactly 1`);
+    }
+    return commits[0];
+}
 // Runs LAST in getSource — the checkout has already succeeded. Uploads the base (cold) or
 // this branch's refreshed delta (seeded). Hardened so it can NEVER fail the step: its own
 // try/catch for normal errors, plus scoped process guards (installed only for the upload
@@ -42015,7 +42115,7 @@ async function setupInner(settings) {
 // bypasses the promise chain, like the arg-length crash we hit on Windows — into a clean
 // exit(0). Safe because nothing checkout-relevant runs after this point.
 async function contribute(settings) {
-    if (plan.mode !== 'cold-build' && plan.mode !== 'seeded') {
+    if (plan.mode === 'off') {
         return;
     }
     const guard = (error) => {
@@ -42028,17 +42128,21 @@ async function contribute(settings) {
         if (plan.mode === 'cold-build') {
             await uploadBaseMirror(settings);
         }
-        else {
+        else if (plan.mode === 'seeded') {
             await uploadBranchDelta(settings);
+        }
+        else {
+            // shallow-seeded / shallow-cold: refresh this branch's snapshot to the current tip.
+            await uploadShallowSnapshot(settings);
         }
     }
     catch (error) {
         warning(`WarpBuild mirror upload skipped: ${error}`);
     }
     finally {
-        // Seeded mode created the internal refs/wb/* namespace; strip it so the customer's
+        // Seeded modes created the internal refs/wb/* namespace; strip it so the customer's
         // .git carries no mirror fingerprint (matches upstream; won't break push --mirror).
-        if (plan.mode === 'seeded') {
+        if (plan.mode === 'seeded' || plan.mode === 'shallow-seeded') {
             await cleanupWbRefs(settings.repositoryPath);
         }
         process.removeListener('uncaughtException', guard);
@@ -42208,6 +42312,40 @@ async function hasBaseRefs(repoPath) {
     await exec_exec('git', ['-C', repoPath, 'for-each-ref', '--count=1', '--format=1', BASE_REFNS], { silent: true, listeners: { stdout: (d) => (out += d.toString()) } });
     return out.trim().length > 0;
 }
+// Refresh this branch's cached snapshot to the current tip: pack exactly the tip's depth-1
+// snapshot — the tip commit + its full tree + blobs, no ancestry (`rev-list --no-walk`) — and
+// overwrite the branch's pack. Single-flighted server-side; concurrent jobs skip when locked.
+async function uploadShallowSnapshot(settings) {
+    if (!plan.refKey) {
+        return; // tag / detached HEAD: nothing to key on
+    }
+    const grant = await requestShallowUpload(plan.repoKey, plan.refKey);
+    if (grant.kind !== 'grant') {
+        info(`Shallow snapshot upload skipped (${grant.kind})`);
+        return;
+    }
+    const repoPath = settings.repositoryPath;
+    let revs = '';
+    await exec_exec('git', ['-C', repoPath, 'rev-list', '--objects', '--no-walk', settings.commit], { silent: true, listeners: { stdout: (d) => (revs += d.toString()) } });
+    const base = tempPackBase();
+    let sha = '';
+    await exec_exec('git', ['-C', repoPath, 'pack-objects', base], {
+        input: Buffer.from(revs),
+        listeners: { stdout: (d) => (sha += d.toString()) }
+    });
+    sha = sha.trim();
+    const packFile = `${base}-${sha}.pack`;
+    try {
+        await httpPut(grant.url, packFile);
+        info(`Uploaded shallow snapshot for '${plan.refKey}'`);
+    }
+    finally {
+        // pack-objects writes -<sha>.{pack,idx,rev}; only the pack is uploaded, clean them all.
+        await external_fs_namespaceObject.promises.rm(packFile, { force: true });
+        await external_fs_namespaceObject.promises.rm(`${base}-${sha}.idx`, { force: true });
+        await external_fs_namespaceObject.promises.rm(`${base}-${sha}.rev`, { force: true });
+    }
+}
 // Download a presigned GET to dest with concurrent HTTP range requests, so the base bundle
 // (tens/hundreds of MiB) transfers at link rate instead of the single-stream ~15 MB/s ceiling.
 // Falls back to a single stream when the server doesn't support ranges.
@@ -42344,17 +42482,24 @@ function tempBundlePath(tag) {
     }
     return external_path_namespaceObject.join(mirrorTmpDir, `wb-${tag}-${external_crypto_namespaceObject.randomBytes(12).toString('hex')}.bundle`);
 }
+// A private mkdtemp'd base path for `git pack-objects` output (it appends -<sha>.pack/.idx/.rev).
+function tempPackBase() {
+    if (!mirrorTmpDir) {
+        mirrorTmpDir = external_fs_namespaceObject.mkdtempSync(external_path_namespaceObject.join(external_os_namespaceObject.tmpdir(), 'wb-mirror-'));
+    }
+    return external_path_namespaceObject.join(mirrorTmpDir, `wb-snap-${external_crypto_namespaceObject.randomBytes(12).toString('hex')}`);
+}
 // Kept for callers/tests: reset .git/objects to the empty `git init` shape.
 async function resetGitObjects(gitDir) {
-    await fs.promises.rm(path.join(gitDir, 'objects'), {
+    await external_fs_namespaceObject.promises.rm(external_path_namespaceObject.join(gitDir, 'objects'), {
         recursive: true,
         force: true
     });
-    await fs.promises.rm(path.join(gitDir, 'shallow'), { force: true });
-    await fs.promises.mkdir(path.join(gitDir, 'objects', 'info'), {
+    await external_fs_namespaceObject.promises.rm(external_path_namespaceObject.join(gitDir, 'shallow'), { force: true });
+    await external_fs_namespaceObject.promises.mkdir(external_path_namespaceObject.join(gitDir, 'objects', 'info'), {
         recursive: true
     });
-    await fs.promises.mkdir(path.join(gitDir, 'objects', 'pack'), {
+    await external_fs_namespaceObject.promises.mkdir(external_path_namespaceObject.join(gitDir, 'objects', 'pack'), {
         recursive: true
     });
 }
@@ -42508,6 +42653,24 @@ async function getSource(settings) {
                 warpbuildMode = 'off';
             }
         }
+        else if (warpbuildMode === 'shallow-seeded') {
+            // Seeded a shallow snapshot: fetch the tip at depth 1, negotiating against the anchored
+            // snapshot so GitHub sends only the delta. Fall back cleanly on any failure.
+            try {
+                const refSpec = getRefSpec(settings.ref, settings.commit);
+                await git.fetch(refSpec, { ...fetchOptions, fetchDepth: 1 });
+                if (!(await testRef(git, settings.ref, settings.commit))) {
+                    throw new Error(`The ref '${settings.ref}' does not point to the expected commit '${settings.commit}'. ` +
+                        `The ref may have been updated after the workflow was triggered.`);
+                }
+                warpbuildFetchDone = true;
+            }
+            catch (error) {
+                warning(`WarpBuild shallow mirror fetch failed; falling back to standard checkout: ${error}`);
+                await abandon(settings);
+                warpbuildMode = 'off';
+            }
+        }
         if (warpbuildFetchDone) {
             // The seeded delta fetch already brought in the target commit.
         }
@@ -42603,10 +42766,19 @@ async function getSource(settings) {
         setOutput('commit', commitSHA.trim());
         // Check for incorrect pull request merge commit
         await checkCommitInfo(settings.authToken, commitInfo, settings.repositoryOwner, settings.repositoryName, settings.ref, settings.commit, settings.githubServerUrl);
-        // WarpBuild mirror: best-effort upload, run LAST in getSource so it can never affect
-        // the checkout result. Belt-and-suspenders around contribute()'s own try/catch and the
-        // scoped process guard it installs (which ignores any uncaught upload error now that
-        // the checkout is already complete).
+        // Remove auth BEFORE the best-effort mirror upload. contribute() installs a fail-open
+        // process guard that can process.exit(0) on an uncaught upload error, and process.exit does
+        // NOT unwind `finally` — so the http.extraheader credential must be cleared from the
+        // workspace .git/config first, or it could be left behind for later steps. contribute()
+        // needs no git auth (it reads local objects and PUTs to presigned URLs). Repeated
+        // idempotently in `finally` below to also cover the checkout-failure path.
+        if (authHelper && !settings.persistCredentials) {
+            startGroup('Removing auth');
+            await authHelper.removeAuth();
+            endGroup();
+        }
+        // WarpBuild mirror: best-effort upload, run LAST (after auth removal) so it can never affect
+        // the checkout result or leave credentials behind.
         try {
             await contribute(settings);
         }
@@ -42615,12 +42787,12 @@ async function getSource(settings) {
         }
     }
     finally {
-        // Remove auth
+        // Remove auth — idempotent belt-and-suspenders: the pre-upload call above covers the success
+        // path; this covers a checkout failure (where the block above never ran) and clears the temp
+        // global config.
         if (authHelper) {
             if (!settings.persistCredentials) {
-                startGroup('Removing auth');
                 await authHelper.removeAuth();
-                endGroup();
             }
             authHelper.removeGlobalConfig();
         }

@@ -118,3 +118,52 @@ export async function requestBranchUpload(
 ): Promise<UploadGrant> {
   return requestUpload('branch/upload-url', {repo_key: repoKey, ref, sha})
 }
+
+// GET shallow/restore-url: the per-branch depth-1 snapshot pack to seed a shallow checkout.
+// 'cold' = no snapshot yet for this branch.
+export type ShallowRestoreLookup =
+  | {kind: 'restore'; pack: Presigned}
+  | {kind: 'cold'}
+  | {kind: 'disabled'}
+  | {kind: 'error'}
+
+export async function lookupShallowRestore(
+  repoKey: string,
+  ref: string
+): Promise<ShallowRestoreLookup> {
+  try {
+    const res = await fetch(
+      `${endpoint('shallow/restore-url')}?repo_key=${encodeURIComponent(
+        repoKey
+      )}&ref=${encodeURIComponent(ref)}`,
+      {
+        headers: {authorization: authHeader()},
+        signal: AbortSignal.timeout(API_TIMEOUT_MS)
+      }
+    )
+    if (res.status === 200) {
+      const body = (await res.json()) as {pack: Presigned}
+      return {kind: 'restore', pack: body.pack}
+    }
+    if (res.status === 404) {
+      return {kind: 'cold'}
+    }
+    if (res.status === 403) {
+      core.debug('[wb-cache] shallow restore-url answered 403 (disabled)')
+      return {kind: 'disabled'}
+    }
+    core.debug(`[wb-cache] shallow restore-url answered ${res.status}`)
+    return {kind: 'error'}
+  } catch (error) {
+    core.debug(`[wb-cache] shallow restore-url failed: ${error}`)
+    return {kind: 'error'}
+  }
+}
+
+// Warm branch: request the grant to overwrite this branch's shallow snapshot pack.
+export async function requestShallowUpload(
+  repoKey: string,
+  ref: string
+): Promise<UploadGrant> {
+  return requestUpload('shallow/upload-url', {repo_key: repoKey, ref})
+}

@@ -37,8 +37,16 @@ const SHA_PATTERN = /^[0-9a-f]{40}([0-9a-f]{24})?$/
 const BASE_REFNS = 'refs/wb/base'
 const BRANCH_REFNS = 'refs/wb/branch'
 const UPLOAD_TIP_REF = 'refs/wb/tip'
+// Anchors the seeded shallow snapshot's tip so git advertises it as a `have` (delta negotiation
+// reads haves from refs, not loose objects), out of the user's ref space like the others.
+const SHALLOW_BASE_REF = 'refs/wb/shallow-base'
 
-export type MirrorMode = 'off' | 'seeded' | 'cold-build'
+export type MirrorMode =
+  | 'off'
+  | 'seeded'
+  | 'cold-build'
+  | 'shallow-seeded' // fetch-depth 1: seeded a snapshot, delta-fetch the tip
+  | 'shallow-cold' // fetch-depth 1: no snapshot yet, standard fetch then cache it
 
 interface Plan {
   mode: MirrorMode
@@ -48,13 +56,13 @@ interface Plan {
 }
 let plan: Plan = {mode: 'off', repoKey: '', refKey: ''}
 
-// Null = attempt the cache; else a reason to log. We engage only where the result matches
-// upstream: full history (fetch-depth 0) or the default depth 1. An explicit shallow depth
-// (>= 2) is a deliberate request we can't honour (the mirror is full history), so we defer
-// to upstream. sparse/filter change the object set we model, so they defer too. LFS does
-// NOT defer: the bundle carries the git objects (including LFS pointer blobs), and the
-// stock `git lfs fetch`/`checkout` steps pull the actual LFS binaries from GitHub on top,
-// exactly as upstream — the mirror only accelerates the git-object half.
+// Null = attempt the cache; else a reason to log. We engage where we can reproduce upstream:
+// full history (fetch-depth 0) via the base mirror, or the default depth 1 via a per-branch
+// shallow snapshot (routed in setupInner). An explicit deeper shallow (>= 2) is a request
+// neither flow reproduces, so it defers to upstream; sparse/filter change the object set we
+// model, so they defer too. LFS does NOT defer: the seed carries the git objects (including
+// LFS pointer blobs), and the stock `git lfs fetch`/`checkout` steps pull the actual LFS
+// binaries from GitHub on top, exactly as upstream — the mirror only accelerates git objects.
 export function getMirrorCacheSkipReason(
   settings: IGitSourceSettings
 ): string | null {
@@ -71,18 +79,13 @@ export function getMirrorCacheSkipReason(
   if (checkoutRepo !== process.env['GITHUB_REPOSITORY']) {
     return `repository '${checkoutRepo}' is not the workflow repository '${process.env['GITHUB_REPOSITORY']}'`
   }
-  const server = (settings.githubServerUrl || 'https://github.com').replace(
-    /\/+$/,
-    ''
-  )
-  if (server !== 'https://github.com') {
-    return `server '${server}' is not github.com`
-  }
+  // github.com + GHE both engage; the backend namespaces the cache by the runner's server-derived
+  // VCS host, so a GHE repo can't collide with — or leak into — a same-named github.com repo.
   if (!settings.commit || !SHA_PATTERN.test(settings.commit)) {
     return 'no exact commit sha to key on'
   }
-  // Respect an explicit shallow request: depth 0 (all) and the default depth 1 engage the
-  // mirror; anything deeper is a deliberate shallow the mirror can't reproduce → upstream.
+  // depth 0 (all history) and the default depth 1 both engage — 0 via the base mirror, 1 via a
+  // per-branch shallow snapshot; an explicit deeper shallow is a request neither reproduces → upstream.
   if (settings.fetchDepth > 1) {
     return `fetch-depth ${settings.fetchDepth} is an explicit shallow depth; using upstream checkout`
   }
@@ -119,7 +122,10 @@ export function computeRefKey(settings: IGitSourceSettings): string {
 // branch on. Never throws. Sets the `cache-hit` output (true only when seeded from cache).
 export async function setup(settings: IGitSourceSettings): Promise<MirrorMode> {
   const mode = await setupImpl(settings)
-  core.setOutput('cache-hit', mode === 'seeded' ? 'true' : 'false')
+  core.setOutput(
+    'cache-hit',
+    mode === 'seeded' || mode === 'shallow-seeded' ? 'true' : 'false'
+  )
   return mode
 }
 
@@ -127,9 +133,15 @@ export async function setup(settings: IGitSourceSettings): Promise<MirrorMode> {
 // the caller can retry the standard fetch against a clean repo. Also re-sets cache-hit to
 // false since we're no longer serving from cache.
 export async function abandon(settings: IGitSourceSettings): Promise<void> {
+  const wasShallow = plan.mode === 'shallow-seeded'
   plan = {mode: 'off', repoKey: '', refKey: ''}
   core.setOutput('cache-hit', 'false')
   await cleanupWbRefs(settings.repositoryPath)
+  if (wasShallow) {
+    // The shallow seed dropped a pack and wrote .git/shallow; reset objects so the fallback
+    // `git fetch --depth 1` starts from a clean git-init shape.
+    await resetGitObjects(path.join(settings.repositoryPath, '.git'))
+  }
 }
 
 async function setupImpl(settings: IGitSourceSettings): Promise<MirrorMode> {
@@ -159,6 +171,12 @@ async function setupInner(settings: IGitSourceSettings): Promise<MirrorMode> {
   const repoKey = process.env['GITHUB_REPOSITORY_ID'] as string
   const refKey = computeRefKey(settings)
   plan = {mode: 'off', repoKey, refKey}
+
+  // fetch-depth 1 (the default) uses a small per-branch shallow snapshot + a GitHub delta,
+  // not the full base mirror — the base flow below is for full history (depth 0).
+  if (settings.fetchDepth === 1) {
+    return await setupShallow(settings, repoKey, refKey)
+  }
 
   const lookup = await api.lookupRestore(repoKey, refKey)
   if (lookup.kind === 'disabled') {
@@ -211,6 +229,87 @@ async function setupInner(settings: IGitSourceSettings): Promise<MirrorMode> {
   return 'seeded'
 }
 
+// fetch-depth 1: seed a small per-branch shallow snapshot (the tip's own pack) so the GitHub
+// fetch is a depth-1 delta against it. Miss → standard shallow fetch, then cache the snapshot
+// in POST. Needs a durable branch to key on (tags/detached HEAD have none → upstream).
+async function setupShallow(
+  settings: IGitSourceSettings,
+  repoKey: string,
+  refKey: string
+): Promise<MirrorMode> {
+  if (!refKey) {
+    core.info(
+      'No durable branch to key the shallow snapshot on; using standard shallow checkout'
+    )
+    return 'off'
+  }
+  const lookup = await api.lookupShallowRestore(repoKey, refKey)
+  if (lookup.kind === 'disabled') {
+    core.info('Mirror cache is disabled by the backend for this organization')
+    return 'off'
+  }
+  if (lookup.kind === 'error') {
+    core.info('Mirror cache backend unavailable; using standard checkout')
+    return 'off'
+  }
+  if (lookup.kind === 'cold') {
+    core.info(
+      'No cached shallow snapshot for this branch; standard shallow checkout, then caching it'
+    )
+    plan = {mode: 'shallow-cold', repoKey, refKey}
+    return 'shallow-cold'
+  }
+  await seedShallowPack(settings.repositoryPath, lookup.pack.url)
+  core.info('Seeded shallow snapshot; the GitHub fetch will be a depth-1 delta')
+  plan = {mode: 'shallow-seeded', repoKey, refKey}
+  return 'shallow-seeded'
+}
+
+// Restore a cached shallow snapshot: drop its pack into the object store and index it in place
+// (git pairs .pack/.idx by basename), then mark the pack's lone commit as the shallow boundary
+// and anchor it to a ref so git advertises it as a `have` for the delta fetch.
+async function seedShallowPack(repoPath: string, url: string): Promise<void> {
+  const gitDir = path.join(repoPath, '.git')
+  const packPath = path.join(
+    gitDir,
+    'objects',
+    'pack',
+    `wb-shallow-${crypto.randomBytes(12).toString('hex')}.pack`
+  )
+  await downloadTo(url, packPath, 'shallow')
+  await exec.exec('git', ['-C', repoPath, 'index-pack', packPath])
+  const tip = await deriveShallowTip(repoPath)
+  await fs.promises.writeFile(path.join(gitDir, 'shallow'), `${tip}\n`)
+  await exec.exec('git', ['-C', repoPath, 'update-ref', SHALLOW_BASE_REF, tip])
+}
+
+// The cached snapshot pack holds exactly one commit — the tip. Return it (what we write to
+// .git/shallow and anchor). Throws if the pack isn't a clean single-commit depth-1 snapshot.
+async function deriveShallowTip(repoPath: string): Promise<string> {
+  let out = ''
+  await exec.exec(
+    'git',
+    [
+      '-C',
+      repoPath,
+      'cat-file',
+      '--batch-all-objects',
+      '--batch-check=%(objecttype) %(objectname)'
+    ],
+    {silent: true, listeners: {stdout: (d: Buffer) => (out += d.toString())}}
+  )
+  const commits = out
+    .split('\n')
+    .filter(l => l.startsWith('commit '))
+    .map(l => l.slice('commit '.length).trim())
+  if (commits.length !== 1) {
+    throw new Error(
+      `shallow snapshot has ${commits.length} commits, expected exactly 1`
+    )
+  }
+  return commits[0]
+}
+
 // Runs LAST in getSource — the checkout has already succeeded. Uploads the base (cold) or
 // this branch's refreshed delta (seeded). Hardened so it can NEVER fail the step: its own
 // try/catch for normal errors, plus scoped process guards (installed only for the upload
@@ -218,7 +317,7 @@ async function setupInner(settings: IGitSourceSettings): Promise<MirrorMode> {
 // bypasses the promise chain, like the arg-length crash we hit on Windows — into a clean
 // exit(0). Safe because nothing checkout-relevant runs after this point.
 export async function contribute(settings: IGitSourceSettings): Promise<void> {
-  if (plan.mode !== 'cold-build' && plan.mode !== 'seeded') {
+  if (plan.mode === 'off') {
     return
   }
   const guard = (error: unknown): void => {
@@ -232,15 +331,18 @@ export async function contribute(settings: IGitSourceSettings): Promise<void> {
   try {
     if (plan.mode === 'cold-build') {
       await uploadBaseMirror(settings)
-    } else {
+    } else if (plan.mode === 'seeded') {
       await uploadBranchDelta(settings)
+    } else {
+      // shallow-seeded / shallow-cold: refresh this branch's snapshot to the current tip.
+      await uploadShallowSnapshot(settings)
     }
   } catch (error) {
     core.warning(`WarpBuild mirror upload skipped: ${error}`)
   } finally {
-    // Seeded mode created the internal refs/wb/* namespace; strip it so the customer's
+    // Seeded modes created the internal refs/wb/* namespace; strip it so the customer's
     // .git carries no mirror fingerprint (matches upstream; won't break push --mirror).
-    if (plan.mode === 'seeded') {
+    if (plan.mode === 'seeded' || plan.mode === 'shallow-seeded') {
       await cleanupWbRefs(settings.repositoryPath)
     }
     process.removeListener('uncaughtException', guard)
@@ -440,6 +542,48 @@ async function hasBaseRefs(repoPath: string): Promise<boolean> {
   return out.trim().length > 0
 }
 
+// Refresh this branch's cached snapshot to the current tip: pack exactly the tip's depth-1
+// snapshot — the tip commit + its full tree + blobs, no ancestry (`rev-list --no-walk`) — and
+// overwrite the branch's pack. Single-flighted server-side; concurrent jobs skip when locked.
+async function uploadShallowSnapshot(
+  settings: IGitSourceSettings
+): Promise<void> {
+  if (!plan.refKey) {
+    return // tag / detached HEAD: nothing to key on
+  }
+  const grant = await api.requestShallowUpload(plan.repoKey, plan.refKey)
+  if (grant.kind !== 'grant') {
+    core.info(`Shallow snapshot upload skipped (${grant.kind})`)
+    return
+  }
+
+  const repoPath = settings.repositoryPath
+  let revs = ''
+  await exec.exec(
+    'git',
+    ['-C', repoPath, 'rev-list', '--objects', '--no-walk', settings.commit],
+    {silent: true, listeners: {stdout: (d: Buffer) => (revs += d.toString())}}
+  )
+
+  const base = tempPackBase()
+  let sha = ''
+  await exec.exec('git', ['-C', repoPath, 'pack-objects', base], {
+    input: Buffer.from(revs),
+    listeners: {stdout: (d: Buffer) => (sha += d.toString())}
+  })
+  sha = sha.trim()
+  const packFile = `${base}-${sha}.pack`
+  try {
+    await httpPut(grant.url, packFile)
+    core.info(`Uploaded shallow snapshot for '${plan.refKey}'`)
+  } finally {
+    // pack-objects writes -<sha>.{pack,idx,rev}; only the pack is uploaded, clean them all.
+    await fs.promises.rm(packFile, {force: true})
+    await fs.promises.rm(`${base}-${sha}.idx`, {force: true})
+    await fs.promises.rm(`${base}-${sha}.rev`, {force: true})
+  }
+}
+
 // Download a presigned GET to dest with concurrent HTTP range requests, so the base bundle
 // (tens/hundreds of MiB) transfers at link rate instead of the single-stream ~15 MB/s ceiling.
 // Falls back to a single stream when the server doesn't support ranges.
@@ -601,6 +745,17 @@ function tempBundlePath(tag: string): string {
   return path.join(
     mirrorTmpDir,
     `wb-${tag}-${crypto.randomBytes(12).toString('hex')}.bundle`
+  )
+}
+
+// A private mkdtemp'd base path for `git pack-objects` output (it appends -<sha>.pack/.idx/.rev).
+function tempPackBase(): string {
+  if (!mirrorTmpDir) {
+    mirrorTmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'wb-mirror-'))
+  }
+  return path.join(
+    mirrorTmpDir,
+    `wb-snap-${crypto.randomBytes(12).toString('hex')}`
   )
 }
 

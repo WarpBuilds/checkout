@@ -1,16 +1,21 @@
 # WarpBuild Checkout
 
 This is [WarpBuild's](https://warpbuild.com) fork of `actions/checkout`, a drop-in
-replacement that adds a **git-mirror cache**. On WarpBuild runners it keeps a per-repo
-`base` bundle (full history, built once) plus a small per-branch delta bundle in object
-storage, and seeds them into the repository before the fetch — so the fetch from GitHub
-shrinks to just the **tip delta**. That cuts the requests and bytes pulled from GitHub.
-Bundles download over parallel ranged reads, rather than single-stream.
+replacement that adds a **git-mirror cache**. On WarpBuild runners it caches a copy of the
+repository in object storage and seeds it into the checkout before the fetch, so the fetch
+from GitHub shrinks to just the **delta** — cutting the requests and bytes pulled from GitHub.
+The cache downloads over parallel ranged reads, not single-stream. What's cached depends on the
+checkout shape:
 
-- Engages only on WarpBuild runners, for the default shallow (`fetch-depth: 1`) and full
-  (`fetch-depth: 0`) checkout shapes. Explicit shallow (`fetch-depth >= 2`), `filter`, and
-  `sparse-checkout` defer to upstream. **LFS coexists** — the bundle carries the git
-  objects and stock `git lfs` pulls the binaries on top.
+- **Default shallow (`fetch-depth: 1`)** — a small per-branch **shallow snapshot** (just the
+  tip's pack). Once seeded and anchored, the GitHub fetch is only the commits since it, and the
+  result is a normal shallow checkout, byte-identical to upstream.
+- **Full history (`fetch-depth: 0`)** — a per-repo `base` bundle (full history, built once) plus
+  a small per-branch delta bundle. Once seeded, the GitHub fetch is only the tip delta.
+- Explicit shallow (`fetch-depth >= 2`), `filter`, and `sparse-checkout` defer to upstream.
+  **LFS coexists** — the cache carries the git objects and stock `git lfs` pulls the binaries on top.
+- **GitHub Enterprise** — engages on github.com and GitHub Enterprise (Server and Cloud) alike; the
+  cache is namespaced per VCS host, so a repo on one host never shares with — or collides with — another host's.
 - No new inputs; adds one output, `cache-hit` (`true` when the checkout was seeded from the
   mirror). Behavior is identical to upstream everywhere except WarpBuild runners.
 - Fail-open — any cache error degrades to stock `actions/checkout` behavior.
