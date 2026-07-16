@@ -41916,14 +41916,11 @@ function getMirrorCacheSkipReason(settings) {
         return 'GITHUB_REPOSITORY_ID is not set';
     }
     const checkoutRepo = `${settings.repositoryOwner}/${settings.repositoryName}`;
-    // add ghes
     if (checkoutRepo !== process.env['GITHUB_REPOSITORY']) {
         return `repository '${checkoutRepo}' is not the workflow repository '${process.env['GITHUB_REPOSITORY']}'`;
     }
-    const server = (settings.githubServerUrl || 'https://github.com').replace(/\/+$/, '');
-    if (server !== 'https://github.com') {
-        return `server '${server}' is not github.com`;
-    }
+    // github.com + GHE both engage; the backend namespaces the cache by the runner's server-derived
+    // VCS host, so a GHE repo can't collide with — or leak into — a same-named github.com repo.
     if (!settings.commit || !SHA_PATTERN.test(settings.commit)) {
         return 'no exact commit sha to key on';
     }
