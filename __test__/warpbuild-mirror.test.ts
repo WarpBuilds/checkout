@@ -149,6 +149,18 @@ describe('warpbuild mirror cache', () => {
       expect(computeRefKey(settingsFor())).toBe('main')
     })
 
+    it('collapses merge-queue refs to the base branch (no per-PR orphan)', () => {
+      process.env['GITHUB_REF'] =
+        'refs/heads/gh-readonly-queue/main/pr-28626-0123456789abcdef0123456789abcdef01234567'
+      expect(computeRefKey(settingsFor())).toBe('main')
+    })
+
+    it('collapses merge-queue refs whose base branch has slashes', () => {
+      process.env['GITHUB_REF'] =
+        'refs/heads/gh-readonly-queue/release/26.31/pr-1-0123456789abcdef0123456789abcdef01234567'
+      expect(computeRefKey(settingsFor())).toBe('release/26.31')
+    })
+
     it('is empty for tags and bare pull refs (base only, no roll)', () => {
       process.env['GITHUB_REF'] = 'refs/tags/v1.2.3'
       expect(computeRefKey(settingsFor())).toBe('')
