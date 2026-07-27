@@ -41938,23 +41938,39 @@ function getMirrorCacheSkipReason(settings) {
     // LFS intentionally does not skip — see the note above getMirrorCacheSkipReason.
     return null;
 }
-// The durable branch to key the per-branch bundle on. For pull_request events the merge
-// SHA is synthetic, so we key on the base branch; otherwise the pushed branch. '' for
-// tags / detached HEAD → seed the base only, upload nothing.
+// GitHub merge queue pushes to gh-readonly-queue/<base>/pr-<n>-<sha>
+const MERGE_QUEUE_PREFIX = 'gh-readonly-queue/';
+const MERGE_QUEUE_SUFFIX = /\/pr-\d+-[0-9a-f]+$/;
+// The durable branch to key the per-branch bundle on. For pull_request events the merge SHA is
+// synthetic, so we key on the base branch; merge-queue refs likewise collapse to their base branch;
+// otherwise the pushed branch. '' for tags / detached HEAD -> seed the base only, upload nothing.
 function computeRefKey(settings) {
     const baseRef = process.env['GITHUB_BASE_REF']; // set on pull_request events
     if (baseRef) {
         return baseRef;
     }
     const ref = process.env['GITHUB_REF'] || settings.ref || '';
-    if (ref.startsWith('refs/heads/')) {
-        return ref.substring('refs/heads/'.length);
-    }
     if (ref.startsWith('refs/tags/') || ref.startsWith('refs/pull/')) {
         return '';
     }
-    // Already a short branch name, or empty.
-    return SHA_PATTERN.test(ref) ? '' : ref;
+    // Reduce the ref to a short branch name ('' for a detached-HEAD sha).
+    let branch;
+    if (ref.startsWith('refs/heads/')) {
+        branch = ref.slice('refs/heads/'.length);
+    }
+    else if (SHA_PATTERN.test(ref)) {
+        return '';
+    }
+    else {
+        branch = ref; // already short, or empty
+    }
+    // Merge-queue refs collapse to their base branch: gh-readonly-queue/<base>/pr-<n>-<sha> -> <base>
+    if (branch.startsWith(MERGE_QUEUE_PREFIX)) {
+        return branch
+            .slice(MERGE_QUEUE_PREFIX.length)
+            .replace(MERGE_QUEUE_SUFFIX, '');
+    }
+    return branch;
 }
 // Runs after `git init`, before the fetch. Returns the mode the fetch/contribute steps
 // branch on. Never throws. Sets the `cache-hit` output (true only when seeded from cache).
