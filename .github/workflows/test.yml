@@ -188,7 +188,7 @@ jobs:
       # Worktree credentials in container step
       - name: Verify worktree credentials in container step
         if: runner.os == 'Linux'
-        uses: docker://bitnami/git:latest
+        uses: docker://bitnami/git@sha256:39cfadda7f52efd82655b71bfe5aecac4c7d64e7f8a581d8d49715f665293a7a
         with:
           args: bash __test__/verify-worktree.sh worktree-test container-worktree-branch
 
