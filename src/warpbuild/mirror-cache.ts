@@ -624,7 +624,7 @@ async function downloadTo(
       )
       return
     }
-    const segments: [number, number][] = []
+    const segments: Array<[number, number]> = []
     for (let off = 0; off < total; off += SEGMENT_SIZE) {
       segments.push([off, Math.min(SEGMENT_SIZE, total - off)])
     }
@@ -643,7 +643,7 @@ async function downloadTo(
           await fh.write(buf, 0, count, offset)
         }
       }
-      const pool: Promise<void>[] = []
+      const pool: Array<Promise<void>> = []
       for (let k = 0; k < width; k++) {
         pool.push(worker())
       }
