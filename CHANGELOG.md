@@ -1,13 +1,14 @@
 # Changelog
 
+## v7.0.1
+* Skip running unsafe pr check if input is default by @aiqiaoy in https://github.com/actions/checkout/pull/2518
+* Trim only ascii whitespace for branch by @aiqiaoy in https://github.com/actions/checkout/pull/2521
+* Escape values passed to --unset by @aiqiaoy in https://github.com/actions/checkout/pull/2530
+* Various dependency updates
+
 ## v7.0.0
 * Block checking out fork PR for pull_request_target and workflow_run by @aiqiaoy in https://github.com/actions/checkout/pull/2454
-* Bump actions/publish-immutable-action from 0.0.3 to 0.0.4 in the minor-actions-dependencies group across 1 directory by @dependabot[bot] in https://github.com/actions/checkout/pull/2458
-* Bump flatted from 3.3.1 to 3.4.2 by @dependabot[bot] in https://github.com/actions/checkout/pull/2460
-* Bump js-yaml from 4.1.0 to 4.2.0 by @dependabot[bot] in https://github.com/actions/checkout/pull/2461
-* Bump @actions/core and @actions/tool-cache and Remove uuid by @dependabot[bot] in https://github.com/actions/checkout/pull/2459
-* upgrade module to esm and update dependencies by @aiqiaoy in https://github.com/actions/checkout/pull/2463
-* Bump the minor-npm-dependencies group across 1 directory with 3 updates by @dependabot[bot] in https://github.com/actions/checkout/pull/2462
+* Various dependency updates 
 
 ## v6.0.3
 * Fix checkout init for SHA-256 repositories by @yaananth in https://github.com/actions/checkout/pull/2439
