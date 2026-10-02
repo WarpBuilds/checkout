@@ -192,12 +192,20 @@ export async function getSource(settings: IGitSourceSettings): Promise<void> {
 
     let warpbuildFetchDone = false
     if (warpbuildMode === 'seeded') {
-      // Seeded from the mirror: fetch only the tip delta, negotiating against the seeded
-      // objects. No depth — the base is full history, so this stays non-shallow. If it
+      // Seeded from the mirror: fetch all branches + tags like upstream, negotiating against
+      // the seeded objects so only the delta transfers. No depth — the base is full history, so this stays non-shallow. If it
       // fails for any reason, disengage cleanly and fall through to the standard fetch.
       try {
-        const refSpec = refHelper.getRefSpec(settings.ref, settings.commit)
-        await git.fetch(refSpec, fetchOptions)
+        await git.fetch(
+          refHelper.getRefSpecForAllHistory(settings.ref, settings.commit),
+          fetchOptions
+        )
+        if (!(await refHelper.testRef(git, settings.ref, settings.commit))) {
+          await git.fetch(
+            refHelper.getRefSpec(settings.ref, settings.commit),
+            fetchOptions
+          )
+        }
         if (!(await refHelper.testRef(git, settings.ref, settings.commit))) {
           throw new Error(
             `The ref '${settings.ref}' does not point to the expected commit '${settings.commit}'. ` +
