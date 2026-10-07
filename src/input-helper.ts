@@ -119,6 +119,10 @@ export async function getInputs(): Promise<IGitSourceSettings> {
     (core.getInput('sparse-checkout-cone-mode') || 'true').toUpperCase() ===
     'TRUE'
 
+  result.cacheUpload =
+    (core.getInput('cache-upload') || 'true').toUpperCase() === 'TRUE'
+  core.debug(`cache upload = ${result.cacheUpload}`)
+
   // Fetch depth
   result.fetchDepth = Math.floor(Number(core.getInput('fetch-depth') || '1'))
   if (isNaN(result.fetchDepth) || result.fetchDepth < 0) {

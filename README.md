@@ -16,10 +16,23 @@ checkout shape:
   **LFS coexists** — the cache carries the git objects and stock `git lfs` pulls the binaries on top.
 - **GitHub Enterprise** — engages on github.com and GitHub Enterprise (Server and Cloud) alike; the
   cache is namespaced per VCS host, so a repo on one host never shares with — or collides with — another host's.
-- No new inputs; adds one output, `cache-hit` (`true` when the checkout was seeded from the
-  mirror). Behavior is identical to upstream everywhere except WarpBuild runners.
+- Adds the `cache-upload` input (default `true`) and the `cache-hit` output (`true` when
+  the checkout was seeded from the mirror). Behavior is identical to upstream everywhere
+  except WarpBuild runners.
 - Fail-open — any cache error degrades to stock `actions/checkout` behavior.
 - All fork code lives in `src/warpbuild/`.
+
+## Upload the cache only on main
+
+Set `cache-upload` to control which runs refresh the mirror. Cache restores remain
+available when uploads are disabled; a cache miss uses a normal GitHub checkout.
+For example, let PRs restore from the cache and only refresh it on pushes to `main`:
+
+```yaml
+- uses: braintrustdata/checkout@<commit-sha>
+  with:
+    cache-upload: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+```
 
 ---
 
@@ -155,6 +168,11 @@ Please refer to the [release page](https://github.com/WarpBuilds/checkout/releas
     # Specifies whether to use cone-mode when doing a sparse checkout.
     # Default: true
     sparse-checkout-cone-mode: ''
+
+    # Whether to upload WarpBuild mirror cache snapshots and bundles after checkout.
+    # Set to false to restore from the cache without updating it.
+    # Default: true
+    cache-upload: ''
 
     # Number of commits to fetch. 0 indicates all history for all branches and tags.
     # Default: 1

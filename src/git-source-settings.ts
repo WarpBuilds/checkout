@@ -49,6 +49,8 @@ export interface IGitSourceSettings {
    */
   fetchDepth: number
 
+  cacheUpload: boolean
+
   /**
    * Fetch tags, even if fetchDepth > 0 (default: false)
    */

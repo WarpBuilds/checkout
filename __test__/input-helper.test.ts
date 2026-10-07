@@ -116,6 +116,7 @@ describe('input-helper tests', () => {
     expect(settings.filter).toBe(undefined)
     expect(settings.sparseCheckout).toBe(undefined)
     expect(settings.sparseCheckoutConeMode).toBe(true)
+    expect(settings.cacheUpload).toBe(true)
     expect(settings.fetchDepth).toBe(1)
     expect(settings.fetchTags).toBe(false)
     expect(settings.showProgress).toBe(true)
@@ -126,6 +127,17 @@ describe('input-helper tests', () => {
     expect(settings.repositoryPath).toBe(gitHubWorkspace)
     expect(settings.setSafeDirectory).toBe(true)
     expect(settings.allowUnsafePrCheckout).toBe(false)
+  })
+
+  it.each([
+    ['true', true],
+    ['false', false],
+    ['TRUE', true],
+    ['FALSE', false]
+  ])('parses cache-upload=%s', async (input, expected) => {
+    inputs['cache-upload'] = input
+    const settings = await inputHelper.getInputs()
+    expect(settings.cacheUpload).toBe(expected)
   })
 
   it('qualifies ref', async () => {
