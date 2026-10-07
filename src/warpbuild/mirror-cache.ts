@@ -205,6 +205,10 @@ async function setupInner(settings: IGitSourceSettings): Promise<MirrorMode> {
   }
 
   if (lookup.kind === 'cold') {
+    if (!settings.cacheUpload) {
+      core.info('Cold repo: cache uploads disabled; using standard checkout')
+      return 'off'
+    }
     const grant = await api.requestBaseUpload(repoKey)
     if (grant.kind === 'grant') {
       core.info(
@@ -270,8 +274,11 @@ async function setupShallow(
   }
   if (lookup.kind === 'cold') {
     core.info(
-      'No cached shallow snapshot for this branch; standard shallow checkout, then caching it'
+      'No cached shallow snapshot for this branch; using standard shallow checkout'
     )
+    if (!settings.cacheUpload) {
+      return 'off'
+    }
     plan = {mode: 'shallow-cold', repoKey, refKey}
     return 'shallow-cold'
   }
@@ -345,6 +352,10 @@ export async function contribute(settings: IGitSourceSettings): Promise<void> {
   process.on('uncaughtException', guard)
   process.on('unhandledRejection', guard)
   try {
+    if (!settings.cacheUpload) {
+      core.info('WarpBuild mirror upload skipped: cache-upload is false')
+      return
+    }
     if (plan.mode === 'cold-build') {
       await uploadBaseMirror(settings)
     } else if (plan.mode === 'seeded') {

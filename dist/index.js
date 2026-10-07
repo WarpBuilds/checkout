@@ -42292,6 +42292,10 @@ async function setupInner(settings) {
         return 'off';
     }
     if (lookup.kind === 'cold') {
+        if (!settings.cacheUpload) {
+            info('Cold repo: cache uploads disabled; using standard checkout');
+            return 'off';
+        }
         const grant = await requestBaseUpload(repoKey);
         if (grant.kind === 'grant') {
             info('Cold repo: building the base mirror this run (full fetch, then upload)');
@@ -42341,7 +42345,10 @@ async function setupShallow(settings, repoKey, refKey) {
         return 'off';
     }
     if (lookup.kind === 'cold') {
-        info('No cached shallow snapshot for this branch; standard shallow checkout, then caching it');
+        info('No cached shallow snapshot for this branch; using standard shallow checkout');
+        if (!settings.cacheUpload) {
+            return 'off';
+        }
         plan = { mode: 'shallow-cold', repoKey, refKey };
         return 'shallow-cold';
     }
@@ -42399,6 +42406,10 @@ async function contribute(settings) {
     process.on('uncaughtException', guard);
     process.on('unhandledRejection', guard);
     try {
+        if (!settings.cacheUpload) {
+            info('WarpBuild mirror upload skipped: cache-upload is false');
+            return;
+        }
         if (plan.mode === 'cold-build') {
             await uploadBaseMirror(settings);
         }
@@ -43306,6 +43317,9 @@ async function getInputs() {
     result.sparseCheckoutConeMode =
         (getInput('sparse-checkout-cone-mode') || 'true').toUpperCase() ===
             'TRUE';
+    result.cacheUpload =
+        (getInput('cache-upload') || 'true').toUpperCase() === 'TRUE';
+    core_debug(`cache upload = ${result.cacheUpload}`);
     // Fetch depth
     result.fetchDepth = Math.floor(Number(getInput('fetch-depth') || '1'));
     if (isNaN(result.fetchDepth) || result.fetchDepth < 0) {
